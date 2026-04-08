@@ -73,6 +73,20 @@ Or use the helper script from a normal command prompt:
 .\build.bat
 ```
 
+To simulate the GitHub Actions build/validate/package matrix locally:
+
+```shell
+.\all.bat
+.\all.bat tag v1.2.3
+.\all.bat pr workflow 123
+```
+
+That writes local workflow-simulation archives under:
+
+```text
+build\workflow-sim\runner-temp\release-assets\
+```
+
 Optional build type:
 
 ```shell
