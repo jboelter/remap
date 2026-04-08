@@ -40,22 +40,7 @@ jobs:
         id: metadata
         shell: pwsh
         run: |
-          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
-          $fullSha = $env:GITHUB_SHA
-
-          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
-            $event = Get-Content $env:GITHUB_EVENT_PATH | ConvertFrom-Json
-            $versionTag = "pr-$($event.number)-$shortSha"
-          }
-          elseif ($env:GITHUB_REF_TYPE -eq 'branch') {
-            $versionTag = "$($env:GITHUB_REF_NAME)-$shortSha"
-          }
-          else {
-            $versionTag = $env:GITHUB_REF_NAME
-          }
-
-          "version_tag=$versionTag" >> $env:GITHUB_OUTPUT
-          "git_hash=$fullSha" >> $env:GITHUB_OUTPUT
+          .\.github\scripts\resolve-build-metadata.ps1
 
       - name: Build binaries
         shell: pwsh
@@ -72,87 +57,11 @@ jobs:
           REMAP_VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
           REMAP_GIT_HASH: ${{ steps.metadata.outputs.git_hash }}
         run: |
-          function Invoke-CheckedCommand {
-            param(
-              [string] $Path,
-              [string[]] $Arguments
-            )
-
-            & $Path @Arguments
-            if ($LASTEXITCODE -ne 0) {
-              $renderedArgs = if ($Arguments.Count -gt 0) { $Arguments -join ' ' } else { '' }
-              throw "Command failed with exit code $LASTEXITCODE: $Path $renderedArgs"
-            }
-          }
-
-          function Get-PeMachine {
-            param([string] $Path)
-
-            $stream = [System.IO.File]::OpenRead($Path)
-            try {
-              $reader = [System.IO.BinaryReader]::new($stream)
-              $stream.Position = 0x3c
-              $peOffset = $reader.ReadInt32()
-              $stream.Position = $peOffset + 4
-              $machine = $reader.ReadUInt16()
-            }
-            finally {
-              if ($null -ne $reader) {
-                $reader.Dispose()
-              }
-              $stream.Dispose()
-            }
-
-            switch ($machine) {
-              0x8664 { return 'x64' }
-              0xaa64 { return 'arm64' }
-              default { return ('unknown-0x{0:X4}' -f $machine) }
-            }
-          }
-
-          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'build\windows\${{ matrix.architecture }}\${{ matrix.configuration_lower }}'
-          $expectedFiles = @(
-            (Join-Path $outputDir 'remap.exe'),
-            (Join-Path $outputDir 'tap-timer.exe'),
-            (Join-Path $outputDir 'remap.pdb'),
-            (Join-Path $outputDir 'tap-timer.pdb')
-          )
-
-          foreach ($path in $expectedFiles) {
-            if (-not (Test-Path $path)) {
-              throw "Missing expected output: $path"
-            }
-          }
-
-          $executables = @(
-            (Join-Path $outputDir 'remap.exe'),
-            (Join-Path $outputDir 'tap-timer.exe')
-          )
-
-          foreach ($path in $executables) {
-
-            $productVersion = (Get-Item $path).VersionInfo.ProductVersion
-            if ($productVersion -ne $env:REMAP_VERSION_TAG) {
-              throw "Unexpected ProductVersion for $path: '$productVersion'"
-            }
-
-            $comments = (Get-Item $path).VersionInfo.Comments
-            if ($comments -ne $env:REMAP_GIT_HASH) {
-              throw "Unexpected Comments value for $path: '$comments'"
-            }
-
-            $machineType = Get-PeMachine -Path $path
-            if ($machineType -ne '${{ matrix.architecture }}') {
-              throw "Unexpected PE machine type for $path: '$machineType'"
-            }
-          }
-
-          if ('${{ matrix.architecture }}' -eq 'x64') {
-            Invoke-CheckedCommand -Path (Join-Path $outputDir 'remap.exe') -Arguments @('--version')
-            Invoke-CheckedCommand -Path (Join-Path $outputDir 'remap.exe') -Arguments @('--help')
-            Invoke-CheckedCommand -Path (Join-Path $outputDir 'tap-timer.exe') -Arguments @('--version')
-            Invoke-CheckedCommand -Path (Join-Path $outputDir 'tap-timer.exe') -Arguments @('--help')
-          }
+          .\.github\scripts\validate-outputs.ps1 `
+            -OutputDir (Join-Path $env:GITHUB_WORKSPACE 'build\windows\${{ matrix.architecture }}\${{ matrix.configuration_lower }}') `
+            -ExpectedVersionTag $env:REMAP_VERSION_TAG `
+            -ExpectedGitHash $env:REMAP_GIT_HASH `
+            -Architecture '${{ matrix.architecture }}'
 
       - name: Package release archive
         id: package
@@ -160,24 +69,11 @@ jobs:
         env:
           REMAP_VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
         run: |
-          $archiveBaseName = "remap-$env:REMAP_VERSION_TAG-windows-${{ matrix.architecture }}-${{ matrix.configuration_lower }}"
-          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'build\windows\${{ matrix.architecture }}\${{ matrix.configuration_lower }}'
-          $stagingDir = Join-Path $env:RUNNER_TEMP $archiveBaseName
-          $archiveDir = Join-Path $env:RUNNER_TEMP 'release-assets'
-          $archivePath = Join-Path $archiveDir "$archiveBaseName.zip"
-
-          Remove-Item -Recurse -Force $stagingDir -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
-          New-Item -ItemType Directory -Force -Path $archiveDir | Out-Null
-
-          $files = @('remap.exe', 'tap-timer.exe', 'remap.pdb', 'tap-timer.pdb')
-          foreach ($file in $files) {
-            Copy-Item (Join-Path $outputDir $file) -Destination $stagingDir
-          }
-
-          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath $archivePath -Force
-          "archive_name=$archiveBaseName" >> $env:GITHUB_OUTPUT
-          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+          .\.github\scripts\package-release-archive.ps1 `
+            -OutputDir (Join-Path $env:GITHUB_WORKSPACE 'build\windows\${{ matrix.architecture }}\${{ matrix.configuration_lower }}') `
+            -VersionTag $env:REMAP_VERSION_TAG `
+            -Architecture '${{ matrix.architecture }}' `
+            -ConfigurationLower '${{ matrix.configuration_lower }}'
 
       - name: Upload release archive
         uses: actions/upload-artifact@v6
@@ -203,17 +99,7 @@ jobs:
       - name: Verify tag commit is on main
         shell: pwsh
         run: |
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
-          if ($LASTEXITCODE -eq 0) {
-            exit 0
-          }
-
-          if ($LASTEXITCODE -eq 1) {
-            throw "Tag $env:GITHUB_REF_NAME (commit $env:GITHUB_SHA) is not on origin/main."
-          }
-
-          exit $LASTEXITCODE
+          .\.github\scripts\verify-tag-on-main.ps1
 
       - name: Download archives
         uses: actions/download-artifact@v6
