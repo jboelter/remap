@@ -73,6 +73,9 @@ Or use the helper script from a normal command prompt:
 .\build.bat
 ```
 
+The project requires CMake 3.24 or newer. The direct commands and `build.bat`
+both use `cmake --fresh` to force a clean reconfigure per build directory.
+
 To simulate the GitHub Actions build/validate/package matrix locally:
 
 ```shell
