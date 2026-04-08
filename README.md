@@ -47,11 +47,24 @@ This is 100% AI generated code. It is not intended for production use, and may c
 
 ## Build
 
-From a Visual Studio developer environment:
+From a matching Visual Studio developer environment:
 
 ```shell
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang-cl
-cmake --build build
+cmake -S . -B build\windows\x64 -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug
+cmake --build build\windows\x64
+```
+
+That places the x64 binaries under:
+
+```text
+build\windows\x64\debug\
+```
+
+For ARM64:
+
+```shell
+cmake -S . -B build\windows\arm64 -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug
+cmake --build build\windows\arm64
 ```
 
 Or use the helper script from a normal command prompt:
@@ -66,42 +79,55 @@ Optional build type:
 .\build.bat Release
 ```
 
+Or choose the architecture explicitly:
+
+```shell
+.\build.bat Debug x64
+.\build.bat Release arm64
+```
+
+That places the binaries under:
+
+```text
+build\windows\<x64|arm64>\<debug|release|relwithdebinfo|minsizerel>\
+```
+
 ## Usage
 
 Run the proxy with an explicit child command:
 
 ```shell
-.\build\remap.exe -- copilot
+remap.exe -- copilot
 ```
 
 Pick the alternate mapping preset:
 
 ```shell
-.\build\remap.exe --standard-enter -- copilot
+remap.exe --standard-enter -- copilot
 ```
 
 Enable the double-tap Enter override with the default 150ms window:
 
 ```shell
-.\build\remap.exe --double-tap -- copilot
+remap.exe --double-tap -- copilot
 ```
 
 Or tune the double-tap window explicitly:
 
 ```shell
-.\build\remap.exe --double-tap --delay 150 -- copilot
+remap.exe --double-tap --delay 150 -- copilot
 ```
 
 Launch a different child command:
 
 ```shell
-.\build\remap.exe -- child-command arg1 arg2
+remap.exe -- child-command arg1 arg2
 ```
 
 Or set a working directory:
 
 ```shell
-.\build\remap.exe --cwd D:\repo -- copilot
+remap.exe --cwd D:\repo -- copilot
 ```
 
 ## Demo
@@ -109,7 +135,7 @@ Or set a working directory:
 Run the remap tool with the `tap-timer` child to see how it captures and rewrites Enter keys:
 
 ```shell
-> .\build\remap.exe --double-tap --delay 200 -- build\tap-timer.exe
+> .\build\windows\<arch>\debug\remap.exe --double-tap --delay 200 -- .\build\windows\<arch>\debug\tap-timer.exe
 tap-timer: press keys to measure repeated taps.
 Output format:
   <key>
