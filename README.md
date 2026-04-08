@@ -47,11 +47,11 @@ This is 100% AI generated code. It is not intended for production use, and may c
 
 ## Build
 
-From a matching Visual Studio developer environment:
+From a normal Windows shell with Visual Studio 2022 C++ tools installed:
 
 ```shell
-cmake -S . -B build\windows\x64 -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug
-cmake --build build\windows\x64
+cmake -S . -B build\windows\x64 --fresh -G "Visual Studio 17 2022" -A x64
+cmake --build build\windows\x64 --config Debug
 ```
 
 That places the x64 binaries under:
@@ -63,8 +63,8 @@ build\windows\x64\debug\
 For ARM64:
 
 ```shell
-cmake -S . -B build\windows\arm64 -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug
-cmake --build build\windows\arm64
+cmake -S . -B build\windows\arm64 --fresh -G "Visual Studio 17 2022" -A ARM64
+cmake --build build\windows\arm64 --config Debug
 ```
 
 Or use the helper script from a normal command prompt:
@@ -84,6 +84,19 @@ Or choose the architecture explicitly:
 ```shell
 .\build.bat Debug x64
 .\build.bat Release arm64
+```
+
+Local builds embed the version tag `dev` by default. To stamp a specific version into the binaries, pass it through CMake:
+
+```shell
+cmake -S . -B build\windows\x64 --fresh -G "Visual Studio 17 2022" -A x64 "-DREMAP_VERSION_TAG=v1.2.3"
+cmake --build build\windows\x64 --config Release
+```
+
+Or use the helper script:
+
+```shell
+.\build.bat Release x64 "v1.2.3"
 ```
 
 That places the binaries under:
@@ -129,6 +142,39 @@ Or set a working directory:
 ```shell
 remap.exe --cwd D:\repo -- copilot
 ```
+
+Show the embedded version:
+
+```shell
+remap.exe --version
+tap-timer.exe --version
+```
+
+## Releases
+
+Pull requests and pushes to `main` run the build, validation, and packaging matrix and upload the `.zip` files as workflow artifacts.
+
+Pushing a version tag on `main` publishes a GitHub Release through GitHub Actions.
+
+```shell
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+Tags with a hyphen publish prereleases automatically:
+
+```shell
+git tag v1.2.3-rc1
+git push origin v1.2.3-rc1
+```
+
+Each release publishes Windows archives for `x64|arm64` and `Debug|Release` using this naming scheme:
+
+```text
+remap-<tag>-windows-<x64|arm64>-<debug|release>.zip
+```
+
+Each archive contains `remap.exe`, `tap-timer.exe`, `remap.pdb`, and `tap-timer.pdb`. The binaries are built with the MSVC runtime linked statically, so they do not require the VC++ redistributable. The Windows `Comments` field stores the full git commit hash used for the build. Debug archives are included intentionally for troubleshooting, and release archives keep symbols instead of stripping them.
 
 ## Demo
 

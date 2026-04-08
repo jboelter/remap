@@ -1,5 +1,7 @@
 #include <windows.h>
 
+#include "version_info.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -28,6 +30,7 @@ namespace
     {
         Success,
         Help,
+        Version,
         Error
     };
 
@@ -260,7 +263,13 @@ namespace
             << L"  --delay <ms>        Set the double-tap window in milliseconds (requires --double-tap)\n"
             << L"  --cwd <path>        Working directory for the child process\n"
             << L"  -- <command ...>    Required. Treat the remaining tokens as the full child command line\n"
+            << L"  --version           Show version info\n"
             << L"  --help              Show this help text\n";
+    }
+
+    void PrintVersion(std::wstring_view programName)
+    {
+        std::wcout << programName << L" " << remap::version::kTagWide << L"\n";
     }
 
     [[nodiscard]] std::wstring QuoteIfNeeded(std::wstring_view value)
@@ -324,6 +333,12 @@ namespace
             {
                 PrintUsage();
                 return ParseResult::Help;
+            }
+
+            if (arg == L"--version")
+            {
+                PrintVersion(L"remap");
+                return ParseResult::Version;
             }
 
             if (arg == L"--swap-enter")
@@ -801,6 +816,8 @@ int wmain(int argc, wchar_t** argv)
     case ParseResult::Success:
         break;
     case ParseResult::Help:
+        return 0;
+    case ParseResult::Version:
         return 0;
     case ParseResult::Error:
         return 1;
