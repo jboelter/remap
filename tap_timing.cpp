@@ -1,5 +1,7 @@
 #include <windows.h>
 
+#include "version_info.h"
+
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -16,6 +18,7 @@ namespace
     {
         Success,
         Help,
+        Version,
         Error
     };
 
@@ -71,7 +74,7 @@ namespace
     void PrintUsage()
     {
         std::wcout
-            << L"tap-timer [--delay <ms>]\n\n"
+            << L"tap-timer [--delay <ms>] [--version]\n\n"
             << L"Without --delay:\n"
             << L"  <key>\n"
             << L"  <key> <key> <ms>\n\n"
@@ -81,6 +84,11 @@ namespace
             << L"    <key> <key> <ms>\n"
             << L"  otherwise on timeout, prints:\n"
             << L"    <key>\n";
+    }
+
+    void PrintVersion(std::wstring_view programName)
+    {
+        std::wcout << programName << L" " << remap::version::kTagWide << L"\n";
     }
 
     [[nodiscard]] std::chrono::milliseconds PollIntervalUntil(
@@ -111,6 +119,12 @@ namespace
             {
                 PrintUsage();
                 return ParseResult::Help;
+            }
+
+            if (arg == L"--version")
+            {
+                PrintVersion(L"tap-timer");
+                return ParseResult::Version;
             }
 
             if (arg == L"--delay")
@@ -229,6 +243,8 @@ int wmain(int argc, wchar_t** argv)
     case ParseResult::Success:
         break;
     case ParseResult::Help:
+        return 0;
+    case ParseResult::Version:
         return 0;
     case ParseResult::Error:
         return 1;

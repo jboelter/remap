@@ -4,10 +4,10 @@
 
 - Preferred build from a normal Windows shell: `.\build.bat` (defaults to `Debug`).
 - Release build: `.\build.bat Release`.
-- Equivalent manual CMake flow from a Visual Studio developer environment: `cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug` then `cmake --build build`.
-- Build a single target: `cmake --build build --target remap` or `cmake --build build --target tap-timer`.
+- Equivalent manual CMake flow from a normal Windows shell with Visual Studio 2022 C++ tools installed: `cmake -S . -B build\windows\x64 --fresh -G "Visual Studio 17 2022" -A x64` then `cmake --build build\windows\x64 --config Debug`.
+- Build a single target: `cmake --build build\windows\x64 --config Debug --target remap` or `cmake --build build\windows\x64 --config Debug --target tap-timer`.
 - No automated test suite or lint target is configured in this repository. There is no single-test command.
-- The README's focused manual verification path for Enter remapping is: `.\build\remap.exe --double-tap --delay 200 -- .\build\tap-timer.exe`.
+- The README's focused manual verification path for Enter remapping is: `.\build\windows\<arch>\debug\remap.exe --double-tap --delay 200 -- .\build\windows\<arch>\debug\tap-timer.exe`.
 
 ## High-level architecture
 

@@ -22,35 +22,19 @@ if /i "%BUILD_TYPE%"=="Debug" set "BUILD_TYPE_LOWER=debug"
 if /i "%BUILD_TYPE%"=="Release" set "BUILD_TYPE_LOWER=release"
 if /i "%BUILD_TYPE%"=="RelWithDebInfo" set "BUILD_TYPE_LOWER=relwithdebinfo"
 if /i "%BUILD_TYPE%"=="MinSizeRel" set "BUILD_TYPE_LOWER=minsizerel"
+set "VS_PLATFORM=%TARGET_ARCH%"
+if /i "%TARGET_ARCH%"=="arm64" set "VS_PLATFORM=ARM64"
 
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if exist "%VSWHERE%" (
-    set "VSINSTALL="
-    for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requiresAny -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath`) do set "VSINSTALL=%%I"
-    if not defined VSINSTALL (
-        echo Could not find a Visual Studio installation.
-        exit /b 1
-    )
+set "VERSION_TAG=%~3"
+if "%VERSION_TAG%"=="" set "VERSION_TAG=%REMAP_VERSION_TAG%"
 
-    set "VSDEVCMD=!VSINSTALL!\Common7\Tools\VsDevCmd.bat"
-    if not exist "!VSDEVCMD!" (
-        echo Could not find VsDevCmd.bat at "!VSDEVCMD!".
-        exit /b 1
-    )
+set "GIT_HASH=%~4"
+if "%GIT_HASH%"=="" set "GIT_HASH=%REMAP_GIT_HASH%"
 
-    set "HOST_ARCH=amd64"
-    if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "HOST_ARCH=arm64"
-
-    set "VS_TARGET_ARCH=%TARGET_ARCH%"
-    if /i "%TARGET_ARCH%"=="x64" set "VS_TARGET_ARCH=amd64"
-
-    call "!VSDEVCMD!" -arch=%VS_TARGET_ARCH% -host_arch=%HOST_ARCH%
-    if errorlevel 1 exit /b %errorlevel%
-)
-if not exist "%VSWHERE%" if not defined VSCMD_VER (
-    echo Could not find vswhere.exe.
-    exit /b 1
-)
+set "CMAKE_VERSION_ARG="
+if not "%VERSION_TAG%"=="" set "CMAKE_VERSION_ARG=-DREMAP_VERSION_TAG=%VERSION_TAG%"
+set "CMAKE_GIT_HASH_ARG="
+if not "%GIT_HASH%"=="" set "CMAKE_GIT_HASH_ARG=-DREMAP_GIT_HASH=%GIT_HASH%"
 
 where cmake >nul 2>nul
 if errorlevel 1 (
@@ -58,24 +42,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-where ninja >nul 2>nul
-if errorlevel 1 (
-    echo ninja was not found on PATH.
-    exit /b 1
-)
-
-where clang-cl >nul 2>nul
-if errorlevel 1 (
-    echo clang-cl was not found on PATH.
-    exit /b 1
-)
-
 set "BUILD_DIR=build\windows\%TARGET_ARCH%"
 
-cmake -S . -B "%BUILD_DIR%" -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
+cmake -S . -B "%BUILD_DIR%" --fresh -G "Visual Studio 17 2022" -A %VS_PLATFORM% %CMAKE_VERSION_ARG% %CMAKE_GIT_HASH_ARG%
 if errorlevel 1 exit /b %errorlevel%
 
-cmake --build "%BUILD_DIR%"
+cmake --build "%BUILD_DIR%" --config %BUILD_TYPE%
 if errorlevel 1 exit /b %errorlevel%
 
 echo.

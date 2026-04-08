@@ -1,0 +1,11 @@
+#pragma once
+
+namespace remap::version
+{
+inline constexpr char kTag[] = "@REMAP_VERSION_TAG@";
+inline constexpr wchar_t kTagWide[] = L"@REMAP_VERSION_TAG@";
+inline constexpr unsigned short kFileVersionMajor = @REMAP_VERSION_MAJOR@;
+inline constexpr unsigned short kFileVersionMinor = @REMAP_VERSION_MINOR@;
+inline constexpr unsigned short kFileVersionPatch = @REMAP_VERSION_PATCH@;
+inline constexpr unsigned short kFileVersionTweak = @REMAP_VERSION_TWEAK@;
+}

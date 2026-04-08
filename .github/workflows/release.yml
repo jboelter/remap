@@ -1,0 +1,257 @@
+name: Build and Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.architecture }} ${{ matrix.configuration }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            configuration: Debug
+            configuration_lower: debug
+          - architecture: x64
+            configuration: Release
+            configuration_lower: release
+          - architecture: arm64
+            configuration: Debug
+            configuration_lower: debug
+          - architecture: arm64
+            configuration: Release
+            configuration_lower: release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Resolve build metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $fullSha = $env:GITHUB_SHA
+
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            $event = Get-Content $env:GITHUB_EVENT_PATH | ConvertFrom-Json
+            $versionTag = "pr-$($event.number)-$shortSha"
+          }
+          elseif ($env:GITHUB_REF_TYPE -eq 'branch') {
+            $versionTag = "$($env:GITHUB_REF_NAME)-$shortSha"
+          }
+          else {
+            $versionTag = $env:GITHUB_REF_NAME
+          }
+
+          "version_tag=$versionTag" >> $env:GITHUB_OUTPUT
+          "git_hash=$fullSha" >> $env:GITHUB_OUTPUT
+
+      - name: Build binaries
+        shell: pwsh
+        env:
+          REMAP_VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
+          REMAP_GIT_HASH: ${{ steps.metadata.outputs.git_hash }}
+        run: |
+          Set-Location $env:GITHUB_WORKSPACE
+          .\build.bat '${{ matrix.configuration }}' '${{ matrix.architecture }}' "$env:REMAP_VERSION_TAG" "$env:REMAP_GIT_HASH"
+
+      - name: Validate outputs
+        shell: pwsh
+        env:
+          REMAP_VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
+          REMAP_GIT_HASH: ${{ steps.metadata.outputs.git_hash }}
+        run: |
+          function Invoke-CheckedCommand {
+            param(
+              [string] $Path,
+              [string[]] $Arguments
+            )
+
+            & $Path @Arguments
+            if ($LASTEXITCODE -ne 0) {
+              $renderedArgs = if ($Arguments.Count -gt 0) { $Arguments -join ' ' } else { '' }
+              throw "Command failed with exit code $LASTEXITCODE: $Path $renderedArgs"
+            }
+          }
+
+          function Get-PeMachine {
+            param([string] $Path)
+
+            $stream = [System.IO.File]::OpenRead($Path)
+            try {
+              $reader = [System.IO.BinaryReader]::new($stream)
+              $stream.Position = 0x3c
+              $peOffset = $reader.ReadInt32()
+              $stream.Position = $peOffset + 4
+              $machine = $reader.ReadUInt16()
+            }
+            finally {
+              if ($null -ne $reader) {
+                $reader.Dispose()
+              }
+              $stream.Dispose()
+            }
+
+            switch ($machine) {
+              0x8664 { return 'x64' }
+              0xaa64 { return 'arm64' }
+              default { return ('unknown-0x{0:X4}' -f $machine) }
+            }
+          }
+
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'build\windows\${{ matrix.architecture }}\${{ matrix.configuration_lower }}'
+          $expectedFiles = @(
+            (Join-Path $outputDir 'remap.exe'),
+            (Join-Path $outputDir 'tap-timer.exe'),
+            (Join-Path $outputDir 'remap.pdb'),
+            (Join-Path $outputDir 'tap-timer.pdb')
+          )
+
+          foreach ($path in $expectedFiles) {
+            if (-not (Test-Path $path)) {
+              throw "Missing expected output: $path"
+            }
+          }
+
+          $executables = @(
+            (Join-Path $outputDir 'remap.exe'),
+            (Join-Path $outputDir 'tap-timer.exe')
+          )
+
+          foreach ($path in $executables) {
+
+            $productVersion = (Get-Item $path).VersionInfo.ProductVersion
+            if ($productVersion -ne $env:REMAP_VERSION_TAG) {
+              throw "Unexpected ProductVersion for $path: '$productVersion'"
+            }
+
+            $comments = (Get-Item $path).VersionInfo.Comments
+            if ($comments -ne $env:REMAP_GIT_HASH) {
+              throw "Unexpected Comments value for $path: '$comments'"
+            }
+
+            $machineType = Get-PeMachine -Path $path
+            if ($machineType -ne '${{ matrix.architecture }}') {
+              throw "Unexpected PE machine type for $path: '$machineType'"
+            }
+          }
+
+          if ('${{ matrix.architecture }}' -eq 'x64') {
+            Invoke-CheckedCommand -Path (Join-Path $outputDir 'remap.exe') -Arguments @('--version')
+            Invoke-CheckedCommand -Path (Join-Path $outputDir 'remap.exe') -Arguments @('--help')
+            Invoke-CheckedCommand -Path (Join-Path $outputDir 'tap-timer.exe') -Arguments @('--version')
+            Invoke-CheckedCommand -Path (Join-Path $outputDir 'tap-timer.exe') -Arguments @('--help')
+          }
+
+      - name: Package release archive
+        id: package
+        shell: pwsh
+        env:
+          REMAP_VERSION_TAG: ${{ steps.metadata.outputs.version_tag }}
+        run: |
+          $archiveBaseName = "remap-$env:REMAP_VERSION_TAG-windows-${{ matrix.architecture }}-${{ matrix.configuration_lower }}"
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'build\windows\${{ matrix.architecture }}\${{ matrix.configuration_lower }}'
+          $stagingDir = Join-Path $env:RUNNER_TEMP $archiveBaseName
+          $archiveDir = Join-Path $env:RUNNER_TEMP 'release-assets'
+          $archivePath = Join-Path $archiveDir "$archiveBaseName.zip"
+
+          Remove-Item -Recurse -Force $stagingDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $archiveDir | Out-Null
+
+          $files = @('remap.exe', 'tap-timer.exe', 'remap.pdb', 'tap-timer.pdb')
+          foreach ($file in $files) {
+            Copy-Item (Join-Path $outputDir $file) -Destination $stagingDir
+          }
+
+          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath $archivePath -Force
+          "archive_name=$archiveBaseName" >> $env:GITHUB_OUTPUT
+          "archive_path=$archivePath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.package.outputs.archive_name }}
+          path: ${{ steps.package.outputs.archive_path }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag commit is on main
+        shell: pwsh
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -eq 0) {
+            exit 0
+          }
+
+          if ($LASTEXITCODE -eq 1) {
+            throw "Tag $env:GITHUB_REF_NAME (commit $env:GITHUB_SHA) is not on origin/main."
+          }
+
+          exit $LASTEXITCODE
+
+      - name: Download archives
+        uses: actions/download-artifact@v6
+        with:
+          path: release-assets
+          pattern: remap-*
+          merge-multiple: true
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          tag_name="${{ github.ref_name }}"
+          assets=(release-assets/*.zip)
+
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "Error: No .zip files found in release-assets/"
+            exit 1
+          fi
+
+          if gh release view "$tag_name" >/dev/null 2>&1; then
+            gh release upload "$tag_name" "${assets[@]}" --clobber
+            exit 0
+          fi
+
+          args=(
+            "$tag_name"
+            "${assets[@]}"
+            --title "$tag_name"
+            --notes ""
+          )
+
+          if [[ "$tag_name" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${args[@]}"
