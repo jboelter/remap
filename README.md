@@ -31,6 +31,7 @@ This is 100% AI generated code. It is not intended for production use, and may c
 - creates an inner ConPTY for the child
 - forwards child output back to the outer terminal
 - captures console input in the proxy process
+- strips child mouse-tracking VT modes so normal terminal selection keeps working
 - remaps:
   - physical `Enter`
   - physical `Shift+Enter`

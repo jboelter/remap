@@ -3,6 +3,7 @@
 #include "version_info.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -507,6 +508,172 @@ namespace
         return data.empty() || WriteAll(handle, data.data(), static_cast<DWORD>(data.size()));
     }
 
+    [[nodiscard]] bool IsCsiFinalByte(char ch)
+    {
+        return ch >= 0x40 && ch <= 0x7e;
+    }
+
+    [[nodiscard]] bool IsMouseTrackingMode(std::string_view parameter)
+    {
+        static constexpr std::array<std::string_view, 9> kMouseTrackingModes{
+            "9",
+            "1000",
+            "1001",
+            "1002",
+            "1003",
+            "1005",
+            "1006",
+            "1015",
+            "1016"
+        };
+
+        return std::find(kMouseTrackingModes.begin(), kMouseTrackingModes.end(), parameter) != kMouseTrackingModes.end();
+    }
+
+    [[nodiscard]] std::string FilterMouseTrackingMode(std::string_view csi)
+    {
+        if (csi.size() < 5 || csi[0] != '\x1b' || csi[1] != '[' || csi[2] != '?')
+        {
+            return std::string(csi);
+        }
+
+        const char finalByte = csi.back();
+        if (finalByte != 'h' && finalByte != 'l')
+        {
+            return std::string(csi);
+        }
+
+        const auto parameters = csi.substr(3, csi.size() - 4);
+        if (parameters.empty())
+        {
+            return std::string(csi);
+        }
+
+        std::string filtered;
+        bool removedMouseMode = false;
+        std::size_t offset = 0;
+        while (offset <= parameters.size())
+        {
+            const auto separator = parameters.find(';', offset);
+            const auto length = separator == std::string_view::npos ? parameters.size() - offset : separator - offset;
+            const auto parameter = parameters.substr(offset, length);
+
+            if (!parameter.empty() && !IsMouseTrackingMode(parameter))
+            {
+                if (!filtered.empty())
+                {
+                    filtered.push_back(';');
+                }
+                filtered.append(parameter);
+            }
+            else if (IsMouseTrackingMode(parameter))
+            {
+                removedMouseMode = true;
+            }
+
+            if (separator == std::string_view::npos)
+            {
+                break;
+            }
+
+            offset = separator + 1;
+        }
+
+        if (!removedMouseMode)
+        {
+            return std::string(csi);
+        }
+
+        if (filtered.empty())
+        {
+            return {};
+        }
+
+        std::string rebuilt = "\x1b[?";
+        rebuilt += filtered;
+        rebuilt.push_back(finalByte);
+        return rebuilt;
+    }
+
+    struct VtOutputFilter
+    {
+        std::string pendingSequence;
+        bool sawEscape{ false };
+        bool bufferingCsi{ false };
+
+        [[nodiscard]] std::string Filter(std::string_view chunk)
+        {
+            std::string output;
+            output.reserve(chunk.size());
+
+            for (const char ch : chunk)
+            {
+                if (bufferingCsi)
+                {
+                    pendingSequence.push_back(ch);
+                    if (IsCsiFinalByte(ch))
+                    {
+                        output += FilterMouseTrackingMode(pendingSequence);
+                        pendingSequence.clear();
+                        bufferingCsi = false;
+                        sawEscape = false;
+                    }
+                    continue;
+                }
+
+                if (sawEscape)
+                {
+                    if (ch == '[')
+                    {
+                        pendingSequence.push_back(ch);
+                        bufferingCsi = true;
+                        continue;
+                    }
+
+                    output += pendingSequence;
+                    pendingSequence.clear();
+                    sawEscape = false;
+                }
+
+                if (ch == '\x1b')
+                {
+                    pendingSequence.assign(1, ch);
+                    sawEscape = true;
+                    continue;
+                }
+
+                output.push_back(ch);
+            }
+
+            return output;
+        }
+
+        [[nodiscard]] std::string Flush()
+        {
+            std::string output;
+            if (!pendingSequence.empty())
+            {
+                output.swap(pendingSequence);
+            }
+            bufferingCsi = false;
+            sawEscape = false;
+            return output;
+        }
+    };
+
+    [[nodiscard]] std::string ResetMouseTrackingModes()
+    {
+        return "\x1b[?9l"
+               "\x1b[?1000l"
+               "\x1b[?1001l"
+               "\x1b[?1002l"
+               "\x1b[?1003l"
+               "\x1b[?1005l"
+               "\x1b[?1006l"
+               "\x1b[?1015l"
+               "\x1b[?1016l";
+    }
+
     [[nodiscard]] std::string Utf8FromWide(std::wstring_view text)
     {
         if (text.empty())
@@ -780,6 +947,7 @@ namespace
     void PumpOutput(HANDLE outputRead, HANDLE consoleOutput, std::atomic<bool>& running)
     {
         std::vector<std::byte> buffer(8192);
+        VtOutputFilter filter;
         while (running.load())
         {
             DWORD bytesRead = 0;
@@ -789,11 +957,19 @@ namespace
                 break;
             }
 
-            if (!WriteAll(consoleOutput, buffer.data(), bytesRead))
+            const auto chunk = std::string_view(reinterpret_cast<const char*>(buffer.data()), bytesRead);
+            const auto filtered = filter.Filter(chunk);
+            if (!WriteString(consoleOutput, filtered))
             {
                 running.store(false);
                 break;
             }
+        }
+
+        const auto pending = filter.Flush();
+        if (!pending.empty() && !WriteString(consoleOutput, pending))
+        {
+            running.store(false);
         }
     }
 
@@ -1006,14 +1182,20 @@ int wmain(int argc, wchar_t** argv)
     session.inputWrite.reset();
     session.pseudoConsole.reset();
 
+    DWORD exitCode = 0;
+    if (!GetExitCodeProcess(session.child.process.get(), &exitCode))
+    {
+        exitCode = 1;
+    }
+
     if (outputThread.joinable())
     {
         outputThread.join();
     }
 
-    DWORD exitCode = 0;
-    if (!GetExitCodeProcess(session.child.process.get(), &exitCode))
+    if (!WriteString(consoleOutput.get(), ResetMouseTrackingModes()))
     {
+        std::wcerr << L"Failed to reset mouse tracking modes on stdout.\n";
         exitCode = 1;
     }
 
