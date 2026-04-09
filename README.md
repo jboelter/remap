@@ -2,7 +2,7 @@
 
 > Launch a terminal app with session-scoped Enter key remapping, without changing Windows Terminal globally.
 
-`remap` is a small C++ wrapper that runs **inside Windows Terminal**, launches a child command behind an **inner ConPTY**, and remaps `Enter` / `Shift+Enter` only for that one session. An optional double-tap Enter override is also available for tools that need both "submit" and "newline" behaviors.
+`remap` is a small C++ wrapper that runs **inside Windows Terminal**, launches a child command behind an **inner ConPTY**, and remaps `Enter` / `Shift+Enter` only for that one session. The current implementation forwards keyboard input toward the inner ConPTY using its win32-input-mode key-event encoding, and forwards mouse input as bounded VT mouse sequences only when the child explicitly enables mouse tracking. An optional double-tap Enter override is also available for tools that need both "submit" and "newline" behaviors.
 
 Use it when you want a tool such as `copilot` to treat Enter and Shift+Enter behavior differently, but you do **not** want to change your global Windows Terminal keybindings for every tab, shell, or command.
 
@@ -31,7 +31,9 @@ This is 100% AI generated code. It is not intended for production use, and may c
 - creates an inner ConPTY for the child
 - forwards child output back to the outer terminal
 - captures console input in the proxy process
-- strips child mouse-tracking VT modes so normal terminal selection keeps working
+- forwards regular key events to the child as win32-input-mode ConPTY input records
+- keeps inner `?9001` negotiation inside the wrapper instead of leaking it to the outer terminal
+- consumes child mouse-tracking VT modes inside the wrapper and forwards bounded VT mouse input when requested
 - remaps:
   - physical `Enter`
   - physical `Shift+Enter`
@@ -166,6 +168,32 @@ Show the embedded version:
 ```shell
 remap.exe --version
 tap-timer.exe --version
+request-trace.exe --version
+```
+
+Trace what a child app requests from the terminal:
+
+```shell
+request-trace.exe -- copilot
+```
+
+That leaves the child output alone and writes requests such as private modes and
+keyboard negotiation to `request-trace.log`.
+
+`request-trace` is a diagnostic companion, not a full proxy: it preserves the
+child display and logs what the child asks for, but it does not currently
+forward mouse input.
+
+Pick a different log file:
+
+```shell
+request-trace.exe --log copilot-trace.log -- copilot
+```
+
+Run it from a specific working directory:
+
+```shell
+request-trace.exe --cwd D:\repo -- copilot
 ```
 
 ## Releases
@@ -192,7 +220,12 @@ Each release publishes Windows archives for `x64|arm64` and `Debug|Release` usin
 remap-<tag>-windows-<x64|arm64>-<debug|release>.zip
 ```
 
-Each archive contains `remap.exe`, `tap-timer.exe`, `remap.pdb`, and `tap-timer.pdb`. The binaries are built with the MSVC runtime linked statically, so they do not require the VC++ redistributable. The Windows `Comments` field stores the full git commit hash used for the build. Debug archives are included intentionally for troubleshooting, and release archives keep symbols instead of stripping them.
+Each archive contains `remap.exe`, `tap-timer.exe`, `request-trace.exe`, and
+their matching `.pdb` files. The binaries are built with the MSVC runtime
+linked statically, so they do not require the VC++ redistributable. The Windows
+`Comments` field stores the full git commit hash used for the build. Debug
+archives are included intentionally for troubleshooting, and release archives
+keep symbols instead of stripping them.
 
 ## Demo
 

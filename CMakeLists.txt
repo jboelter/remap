@@ -75,11 +75,19 @@ add_executable(tap-timer
     tap_timing.cpp
 )
 
-foreach(target remap tap-timer)
+add_executable(request-trace
+    request_trace.cpp
+)
+
+foreach(target remap tap-timer request-trace)
     if(target STREQUAL "remap")
         set(REMAP_FILE_DESCRIPTION "Windows Terminal key remapper")
-    else()
+    elseif(target STREQUAL "tap-timer")
         set(REMAP_FILE_DESCRIPTION "Key tap timing")
+    elseif(target STREQUAL "request-trace")
+        set(REMAP_FILE_DESCRIPTION "ConPTY request tracer")
+    else()
+        message(FATAL_ERROR "Unexpected target for version metadata: ${target}")
     endif()
     set(REMAP_INTERNAL_NAME "${target}")
     set(REMAP_ORIGINAL_FILENAME "${target}.exe")

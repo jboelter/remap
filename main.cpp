@@ -439,16 +439,34 @@ namespace
         return SetConsoleMode(output, mode) != FALSE;
     }
 
-    [[nodiscard]] bool ConfigureInputMode(HANDLE input)
+    [[nodiscard]] bool ConfigureInputMode(HANDLE input, DWORD originalMode, bool mouseTrackingActive)
     {
-        DWORD mode = 0;
-        if (!GetConsoleMode(input, &mode))
-        {
-            return false;
-        }
-
+        DWORD mode = originalMode;
         mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
         mode |= ENABLE_WINDOW_INPUT;
+
+        if (mouseTrackingActive)
+        {
+            mode |= ENABLE_MOUSE_INPUT | ENABLE_EXTENDED_FLAGS;
+            mode &= ~ENABLE_QUICK_EDIT_MODE;
+        }
+        else
+        {
+            if (originalMode & ENABLE_EXTENDED_FLAGS)
+            {
+                mode |= ENABLE_EXTENDED_FLAGS;
+            }
+
+            if (originalMode & ENABLE_QUICK_EDIT_MODE)
+            {
+                mode |= ENABLE_QUICK_EDIT_MODE;
+            }
+            else
+            {
+                mode &= ~ENABLE_QUICK_EDIT_MODE;
+            }
+        }
+
         return SetConsoleMode(input, mode) != FALSE;
     }
 
@@ -513,24 +531,96 @@ namespace
         return ch >= 0x40 && ch <= 0x7e;
     }
 
-    [[nodiscard]] bool IsMouseTrackingMode(std::string_view parameter)
+    enum MouseTrackingBits : unsigned int
     {
-        static constexpr std::array<std::string_view, 9> kMouseTrackingModes{
-            "9",
-            "1000",
-            "1001",
-            "1002",
-            "1003",
-            "1005",
-            "1006",
-            "1015",
-            "1016"
-        };
+        kMouseX10 = 1u << 0,
+        kMouseClick = 1u << 1,
+        kMouseHighlight = 1u << 2,
+        kMouseDrag = 1u << 3,
+        kMouseAny = 1u << 4,
+        kMouseUtf8 = 1u << 5,
+        kMouseSgr = 1u << 6,
+        kMouseUrxvt = 1u << 7,
+        kMousePixels = 1u << 8
+    };
 
-        return std::find(kMouseTrackingModes.begin(), kMouseTrackingModes.end(), parameter) != kMouseTrackingModes.end();
+    constexpr unsigned int kMouseEventMask = kMouseX10 | kMouseClick | kMouseHighlight | kMouseDrag | kMouseAny;
+    constexpr DWORD kTrackedMouseButtons =
+        FROM_LEFT_1ST_BUTTON_PRESSED |
+        RIGHTMOST_BUTTON_PRESSED |
+        FROM_LEFT_2ND_BUTTON_PRESSED |
+        FROM_LEFT_3RD_BUTTON_PRESSED |
+        FROM_LEFT_4TH_BUTTON_PRESSED;
+
+    struct MouseTrackingState
+    {
+        std::atomic<unsigned int> bits{ 0 };
+
+        [[nodiscard]] unsigned int Load() const noexcept
+        {
+            return bits.load(std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] bool ReportingEnabled() const noexcept
+        {
+            return (Load() & kMouseEventMask) != 0;
+        }
+    };
+
+    [[nodiscard]] std::optional<unsigned int> MouseTrackingBitForParameter(std::string_view parameter)
+    {
+        if (parameter == "9")
+        {
+            return kMouseX10;
+        }
+        if (parameter == "1000")
+        {
+            return kMouseClick;
+        }
+        if (parameter == "1001")
+        {
+            return kMouseHighlight;
+        }
+        if (parameter == "1002")
+        {
+            return kMouseDrag;
+        }
+        if (parameter == "1003")
+        {
+            return kMouseAny;
+        }
+        if (parameter == "1005")
+        {
+            return kMouseUtf8;
+        }
+        if (parameter == "1006")
+        {
+            return kMouseSgr;
+        }
+        if (parameter == "1015")
+        {
+            return kMouseUrxvt;
+        }
+        if (parameter == "1016")
+        {
+            return kMousePixels;
+        }
+        return std::nullopt;
     }
 
-    [[nodiscard]] std::string FilterMouseTrackingMode(std::string_view csi)
+    void UpdateMouseTrackingState(MouseTrackingState& state, unsigned int bit, bool enabled)
+    {
+        if (enabled)
+        {
+            state.bits.fetch_or(bit, std::memory_order_relaxed);
+        }
+        else
+        {
+            state.bits.fetch_and(~bit, std::memory_order_relaxed);
+        }
+    }
+
+    [[nodiscard]] std::string FilterPrivateModes(std::string_view csi, MouseTrackingState& mouseTracking)
     {
         if (csi.size() < 5 || csi[0] != '\x1b' || csi[1] != '[' || csi[2] != '?')
         {
@@ -550,7 +640,8 @@ namespace
         }
 
         std::string filtered;
-        bool removedMouseMode = false;
+        bool removedFilteredMode = false;
+        const bool enable = finalByte == 'h';
         std::size_t offset = 0;
         while (offset <= parameters.size())
         {
@@ -558,17 +649,23 @@ namespace
             const auto length = separator == std::string_view::npos ? parameters.size() - offset : separator - offset;
             const auto parameter = parameters.substr(offset, length);
 
-            if (!parameter.empty() && !IsMouseTrackingMode(parameter))
+            const auto mouseBit = MouseTrackingBitForParameter(parameter);
+            if (mouseBit.has_value())
+            {
+                UpdateMouseTrackingState(mouseTracking, *mouseBit, enable);
+                removedFilteredMode = true;
+            }
+            else if (parameter == "9001")
+            {
+                removedFilteredMode = true;
+            }
+            else if (!parameter.empty())
             {
                 if (!filtered.empty())
                 {
                     filtered.push_back(';');
                 }
                 filtered.append(parameter);
-            }
-            else if (IsMouseTrackingMode(parameter))
-            {
-                removedMouseMode = true;
             }
 
             if (separator == std::string_view::npos)
@@ -579,7 +676,7 @@ namespace
             offset = separator + 1;
         }
 
-        if (!removedMouseMode)
+        if (!removedFilteredMode)
         {
             return std::string(csi);
         }
@@ -597,9 +694,15 @@ namespace
 
     struct VtOutputFilter
     {
+        MouseTrackingState& mouseTracking;
         std::string pendingSequence;
         bool sawEscape{ false };
         bool bufferingCsi{ false };
+
+        explicit VtOutputFilter(MouseTrackingState& trackingState)
+            : mouseTracking(trackingState)
+        {
+        }
 
         [[nodiscard]] std::string Filter(std::string_view chunk)
         {
@@ -613,7 +716,7 @@ namespace
                     pendingSequence.push_back(ch);
                     if (IsCsiFinalByte(ch))
                     {
-                        output += FilterMouseTrackingMode(pendingSequence);
+                        output += FilterPrivateModes(pendingSequence, mouseTracking);
                         pendingSequence.clear();
                         bufferingCsi = false;
                         sawEscape = false;
@@ -674,149 +777,292 @@ namespace
                "\x1b[?1016l";
     }
 
-    [[nodiscard]] std::string Utf8FromWide(std::wstring_view text)
+    enum class EnterKind
     {
-        if (text.empty())
+        None,
+        Plain,
+        ShiftOnly
+    };
+
+    struct PendingEnter
+    {
+        KEY_EVENT_RECORD key{};
+        std::chrono::steady_clock::time_point deadline{};
+    };
+
+    [[nodiscard]] EnterKind ClassifyEnter(const KEY_EVENT_RECORD& key)
+    {
+        if (key.wVirtualKeyCode != VK_RETURN || key.wRepeatCount != 1)
         {
-            return {};
-        }
-
-        const auto size = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            text.data(),
-            static_cast<int>(text.size()),
-            nullptr,
-            0,
-            nullptr,
-            nullptr);
-
-        std::string result(size, '\0');
-        WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            text.data(),
-            static_cast<int>(text.size()),
-            result.data(),
-            size,
-            nullptr,
-            nullptr);
-        return result;
-    }
-
-    [[nodiscard]] std::string Repeat(std::string_view payload, WORD count)
-    {
-        std::string result;
-        result.reserve(payload.size() * std::max<WORD>(count, 1));
-        for (WORD i = 0; i < std::max<WORD>(count, 1); ++i)
-        {
-            result.append(payload);
-        }
-        return result;
-    }
-
-    [[nodiscard]] std::string RawEnterPayload()
-    {
-        return "\r";
-    }
-
-    [[nodiscard]] std::string RemappedEnterPayload(const Config& config)
-    {
-        return config.swapEnter ? "\x1b\r" : "\r";
-    }
-
-    [[nodiscard]] bool IsPlainEnterCandidate(const KEY_EVENT_RECORD& key)
-    {
-        if (!key.bKeyDown || key.wVirtualKeyCode != VK_RETURN || key.wRepeatCount != 1)
-        {
-            return false;
+            return EnterKind::None;
         }
 
         const auto modifiers =
             key.dwControlKeyState & (SHIFT_PRESSED | LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED | LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED);
-        return modifiers == 0;
+        if (modifiers == 0)
+        {
+            return EnterKind::Plain;
+        }
+        if (modifiers == SHIFT_PRESSED)
+        {
+            return EnterKind::ShiftOnly;
+        }
+        return EnterKind::None;
     }
 
-    [[nodiscard]] std::optional<std::string> EncodeKey(const KEY_EVENT_RECORD& key, const Config& config)
+    [[nodiscard]] bool UseRemappedEnterPayload(const Config& config, EnterKind kind)
     {
-        if (!key.bKeyDown)
+        switch (kind)
+        {
+        case EnterKind::Plain:
+            return config.swapEnter;
+        case EnterKind::ShiftOnly:
+            return !config.swapEnter;
+        case EnterKind::None:
+        default:
+            return false;
+        }
+    }
+
+    void AppendWin32InputModeSequence(std::string& payload, const KEY_EVENT_RECORD& key)
+    {
+        payload += "\x1b[";
+        payload += std::to_string(static_cast<unsigned int>(key.wVirtualKeyCode));
+        payload.push_back(';');
+        payload += std::to_string(static_cast<unsigned int>(key.wVirtualScanCode));
+        payload.push_back(';');
+        payload += std::to_string(static_cast<unsigned int>(key.uChar.UnicodeChar));
+        payload.push_back(';');
+        payload += key.bKeyDown ? '1' : '0';
+        payload.push_back(';');
+        payload += std::to_string(static_cast<unsigned int>(key.dwControlKeyState));
+        payload.push_back(';');
+        payload += std::to_string(static_cast<unsigned int>(key.wRepeatCount));
+        payload.push_back('_');
+    }
+
+    [[nodiscard]] std::string SerializeKeyEvent(const KEY_EVENT_RECORD& key)
+    {
+        std::string payload;
+        AppendWin32InputModeSequence(payload, key);
+        return payload;
+    }
+
+    [[nodiscard]] int MouseModifierBits(DWORD controlState)
+    {
+        int modifiers = 0;
+        if ((controlState & SHIFT_PRESSED) != 0)
+        {
+            modifiers += 4;
+        }
+        if ((controlState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0)
+        {
+            modifiers += 8;
+        }
+        if ((controlState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0)
+        {
+            modifiers += 16;
+        }
+        return modifiers;
+    }
+
+    [[nodiscard]] std::optional<int> MouseButtonCode(DWORD buttonState)
+    {
+        if ((buttonState & FROM_LEFT_1ST_BUTTON_PRESSED) != 0)
+        {
+            return 0;
+        }
+        if ((buttonState & FROM_LEFT_2ND_BUTTON_PRESSED) != 0)
+        {
+            return 1;
+        }
+        if ((buttonState & RIGHTMOST_BUTTON_PRESSED) != 0)
+        {
+            return 2;
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::string> BuildMouseSequence(int buttonCode, COORD position, bool sgrEncoding, char terminator)
+    {
+        const int column = static_cast<int>(position.X) + 1;
+        const int row = static_cast<int>(position.Y) + 1;
+        if (column <= 0 || row <= 0)
         {
             return std::nullopt;
         }
 
-        const auto controlState = key.dwControlKeyState;
-        const bool shift = (controlState & SHIFT_PRESSED) != 0;
-        const bool ctrl = (controlState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-        const bool alt = (controlState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
-
-        const std::string enterPayload = RemappedEnterPayload(config);
-        const std::string shiftEnterPayload = config.swapEnter ? "\r" : "\x1b\r";
-
-        switch (key.wVirtualKeyCode)
+        if (sgrEncoding)
         {
-        case VK_RETURN:
-            return Repeat(shift ? shiftEnterPayload : enterPayload, key.wRepeatCount);
-        case VK_TAB:
-            return Repeat(shift ? "\x1b[Z" : "\t", key.wRepeatCount);
-        case VK_BACK:
-            return Repeat("\x7f", key.wRepeatCount);
-        case VK_ESCAPE:
-            return Repeat("\x1b", key.wRepeatCount);
-        case VK_UP:
-            return Repeat("\x1b[A", key.wRepeatCount);
-        case VK_DOWN:
-            return Repeat("\x1b[B", key.wRepeatCount);
-        case VK_RIGHT:
-            return Repeat("\x1b[C", key.wRepeatCount);
-        case VK_LEFT:
-            return Repeat("\x1b[D", key.wRepeatCount);
-        case VK_HOME:
-            return Repeat("\x1b[H", key.wRepeatCount);
-        case VK_END:
-            return Repeat("\x1b[F", key.wRepeatCount);
-        case VK_DELETE:
-            return Repeat("\x1b[3~", key.wRepeatCount);
-        case VK_INSERT:
-            return Repeat("\x1b[2~", key.wRepeatCount);
-        case VK_PRIOR:
-            return Repeat("\x1b[5~", key.wRepeatCount);
-        case VK_NEXT:
-            return Repeat("\x1b[6~", key.wRepeatCount);
-        default:
+            std::string sequence = "\x1b[<";
+            sequence += std::to_string(buttonCode);
+            sequence.push_back(';');
+            sequence += std::to_string(column);
+            sequence.push_back(';');
+            sequence += std::to_string(row);
+            sequence.push_back(terminator);
+            return sequence;
+        }
+
+        if (buttonCode > 223 || column > 223 || row > 223)
+        {
+            return std::nullopt;
+        }
+
+        std::string sequence = "\x1b[M";
+        sequence.push_back(static_cast<char>(32 + buttonCode));
+        sequence.push_back(static_cast<char>(32 + column));
+        sequence.push_back(static_cast<char>(32 + row));
+        return sequence;
+    }
+
+    [[nodiscard]] std::optional<std::string> EncodeMouse(const MOUSE_EVENT_RECORD& mouse, const MouseTrackingState& mouseTracking, DWORD& lastButtonState)
+    {
+        const auto trackingBits = mouseTracking.Load();
+        if ((trackingBits & kMouseEventMask) == 0)
+        {
+            lastButtonState = mouse.dwButtonState & kTrackedMouseButtons;
+            return std::nullopt;
+        }
+
+        const DWORD buttons = mouse.dwButtonState & kTrackedMouseButtons;
+        const int modifiers = MouseModifierBits(mouse.dwControlKeyState);
+        const bool sgrEncoding = (trackingBits & kMouseSgr) != 0;
+
+        std::optional<int> buttonCode;
+        char terminator = 'M';
+
+        switch (mouse.dwEventFlags)
+        {
+        case 0:
+        case DOUBLE_CLICK:
+            if (buttons != 0)
+            {
+                const auto pressedButton = MouseButtonCode(buttons);
+                if (!pressedButton.has_value())
+                {
+                    lastButtonState = buttons;
+                    return std::nullopt;
+                }
+                buttonCode = *pressedButton + modifiers;
+            }
+            else if (lastButtonState != 0)
+            {
+                if (sgrEncoding)
+                {
+                    const auto releasedButton = MouseButtonCode(lastButtonState);
+                    if (!releasedButton.has_value())
+                    {
+                        lastButtonState = buttons;
+                        return std::nullopt;
+                    }
+                    buttonCode = *releasedButton + modifiers;
+                    terminator = 'm';
+                }
+                else
+                {
+                    buttonCode = 3 + modifiers;
+                }
+            }
+            break;
+        case MOUSE_MOVED:
+            if ((trackingBits & (kMouseDrag | kMouseAny)) == 0)
+            {
+                lastButtonState = buttons;
+                return std::nullopt;
+            }
+
+            if (buttons == 0 && (trackingBits & kMouseAny) == 0)
+            {
+                lastButtonState = buttons;
+                return std::nullopt;
+            }
+
+            if (buttons == 0)
+            {
+                buttonCode = 35 + modifiers;
+            }
+            else
+            {
+                const auto movingButton = MouseButtonCode(buttons);
+                if (!movingButton.has_value())
+                {
+                    lastButtonState = buttons;
+                    return std::nullopt;
+                }
+                buttonCode = 32 + *movingButton + modifiers;
+            }
+            break;
+        case MOUSE_WHEELED:
+        {
+            const SHORT delta = static_cast<SHORT>(HIWORD(mouse.dwButtonState));
+            if (delta == 0)
+            {
+                lastButtonState = buttons;
+                return std::nullopt;
+            }
+            buttonCode = (delta > 0 ? 64 : 65) + modifiers;
             break;
         }
-
-        if (ctrl && !alt)
+        case MOUSE_HWHEELED:
         {
-            const WCHAR ch = key.uChar.UnicodeChar;
-            if (ch != 0)
+            const SHORT delta = static_cast<SHORT>(HIWORD(mouse.dwButtonState));
+            if (delta == 0)
             {
-                std::string payload;
-                for (WORD i = 0; i < std::max<WORD>(key.wRepeatCount, 1); ++i)
-                {
-                    payload.push_back(static_cast<char>(ch & 0xff));
-                }
-                return payload;
+                lastButtonState = buttons;
+                return std::nullopt;
             }
-
-            if (key.wVirtualKeyCode == ' ' || key.wVirtualKeyCode == VK_SPACE)
-            {
-                return Repeat(std::string(1, '\0'), key.wRepeatCount);
-            }
+            buttonCode = (delta > 0 ? 67 : 66) + modifiers;
+            break;
+        }
+        default:
+            lastButtonState = buttons;
+            return std::nullopt;
         }
 
-        if (key.uChar.UnicodeChar != 0)
+        lastButtonState = buttons;
+        if (!buttonCode.has_value())
         {
-            std::wstring chars(std::max<WORD>(key.wRepeatCount, 1), key.uChar.UnicodeChar);
-            auto payload = Utf8FromWide(chars);
-            if (alt)
-            {
-                payload.insert(payload.begin(), '\x1b');
-            }
-            return payload;
+            return std::nullopt;
         }
 
-        return std::nullopt;
+        return BuildMouseSequence(*buttonCode, mouse.dwMousePosition, sgrEncoding, terminator);
+    }
+
+    [[nodiscard]] KEY_EVENT_RECORD MakeSyntheticEscapeKey(bool keyDown)
+    {
+        KEY_EVENT_RECORD key{};
+        key.bKeyDown = keyDown ? TRUE : FALSE;
+        key.wRepeatCount = 1;
+        key.wVirtualKeyCode = VK_ESCAPE;
+        key.wVirtualScanCode = 1;
+        key.uChar.UnicodeChar = keyDown ? L'\x1b' : 0;
+        key.dwControlKeyState = 0;
+        return key;
+    }
+
+    [[nodiscard]] KEY_EVENT_RECORD MakeSyntheticEnterKey(const KEY_EVENT_RECORD& source, bool keyDown)
+    {
+        KEY_EVENT_RECORD key = source;
+        key.bKeyDown = keyDown ? TRUE : FALSE;
+        key.wRepeatCount = 1;
+        key.dwControlKeyState &= ~(SHIFT_PRESSED | LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED | LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED);
+        key.uChar.UnicodeChar = keyDown ? L'\r' : 0;
+        return key;
+    }
+
+    [[nodiscard]] std::string BuildEnterPressPayload(const KEY_EVENT_RECORD& source, bool remapped)
+    {
+        std::string payload;
+        if (remapped)
+        {
+            AppendWin32InputModeSequence(payload, MakeSyntheticEscapeKey(true));
+            AppendWin32InputModeSequence(payload, MakeSyntheticEscapeKey(false));
+        }
+
+        AppendWin32InputModeSequence(payload, MakeSyntheticEnterKey(source, true));
+        AppendWin32InputModeSequence(payload, MakeSyntheticEnterKey(source, false));
+        return payload;
     }
 
     [[nodiscard]] bool CreatePipes(UniqueHandle& inputRead, UniqueHandle& inputWrite, UniqueHandle& outputRead, UniqueHandle& outputWrite)
@@ -944,10 +1190,10 @@ namespace
         return true;
     }
 
-    void PumpOutput(HANDLE outputRead, HANDLE consoleOutput, std::atomic<bool>& running)
+    void PumpOutput(HANDLE outputRead, HANDLE consoleOutput, std::atomic<bool>& running, MouseTrackingState& mouseTracking)
     {
         std::vector<std::byte> buffer(8192);
-        VtOutputFilter filter;
+        VtOutputFilter filter(mouseTracking);
         while (running.load())
         {
             DWORD bytesRead = 0;
@@ -1015,6 +1261,13 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
+    DWORD originalInputMode = 0;
+    if (!GetConsoleMode(consoleInput.get(), &originalInputMode))
+    {
+        std::wcerr << L"Failed to read the current console input mode.\n";
+        return 1;
+    }
+
     ConsoleModeGuard inputModeGuard(consoleInput.get());
     ConsoleModeGuard outputModeGuard(consoleOutput.get());
     CodePageGuard codePageGuard;
@@ -1037,7 +1290,7 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
-    if (!ConfigureInputMode(consoleInput.get()))
+    if (!ConfigureInputMode(consoleInput.get(), originalInputMode, false))
     {
         std::wcerr << L"Failed to configure console input mode.\n";
         return 1;
@@ -1049,19 +1302,22 @@ int wmain(int argc, wchar_t** argv)
         return 1;
     }
 
+    MouseTrackingState mouseTracking;
     std::atomic<bool> running{ true };
-    std::thread outputThread(PumpOutput, session.outputRead.get(), consoleOutput.get(), std::ref(running));
-    std::optional<std::chrono::steady_clock::time_point> pendingEnterDeadline;
+    std::thread outputThread(PumpOutput, session.outputRead.get(), consoleOutput.get(), std::ref(running), std::ref(mouseTracking));
+    std::optional<PendingEnter> pendingEnter;
+    bool mouseTrackingActive = false;
+    DWORD lastMouseButtonState = 0;
 
     const auto flushPendingEnter = [&]() -> bool
     {
-        if (!pendingEnterDeadline.has_value())
+        if (!pendingEnter.has_value())
         {
             return true;
         }
 
-        const auto payload = RemappedEnterPayload(config);
-        pendingEnterDeadline.reset();
+        const auto payload = BuildEnterPressPayload(pendingEnter->key, UseRemappedEnterPayload(config, EnterKind::Plain));
+        pendingEnter.reset();
         if (!WriteString(session.inputWrite.get(), payload))
         {
             std::wcerr << L"Failed to write delayed Enter to child input: " << GetLastErrorMessage(GetLastError()) << L"\n";
@@ -1074,13 +1330,25 @@ int wmain(int argc, wchar_t** argv)
 
     while (running.load())
     {
-        if (pendingEnterDeadline.has_value() &&
-            std::chrono::steady_clock::now() >= *pendingEnterDeadline)
+        if (pendingEnter.has_value() &&
+            std::chrono::steady_clock::now() >= pendingEnter->deadline)
         {
             if (!flushPendingEnter())
             {
                 break;
             }
+        }
+
+        const bool nextMouseTrackingState = mouseTracking.ReportingEnabled();
+        if (nextMouseTrackingState != mouseTrackingActive)
+        {
+            if (!ConfigureInputMode(consoleInput.get(), originalInputMode, nextMouseTrackingState))
+            {
+                std::wcerr << L"Failed to update console mouse input mode.\n";
+                running.store(false);
+                break;
+            }
+            mouseTrackingActive = nextMouseTrackingState;
         }
 
         if (WaitForSingleObject(session.child.process.get(), 0) == WAIT_OBJECT_0)
@@ -1099,7 +1367,9 @@ int wmain(int argc, wchar_t** argv)
 
         if (pendingEvents == 0)
         {
-            const auto sleepDuration = PollIntervalUntil(pendingEnterDeadline);
+            const auto sleepDuration = pendingEnter.has_value() ?
+                PollIntervalUntil(std::optional<std::chrono::steady_clock::time_point>{ pendingEnter->deadline }) :
+                PollIntervalUntil(std::nullopt);
             if (sleepDuration.count() > 0)
             {
                 std::this_thread::sleep_for(sleepDuration);
@@ -1121,26 +1391,47 @@ int wmain(int argc, wchar_t** argv)
             const auto& record = records[i];
             HandleResize(record, session.pseudoConsole);
 
+            if (record.EventType == MOUSE_EVENT)
+            {
+                if (pendingEnter.has_value())
+                {
+                    if (!flushPendingEnter())
+                    {
+                        break;
+                    }
+                }
+
+                const auto payload = EncodeMouse(record.Event.MouseEvent, mouseTracking, lastMouseButtonState);
+                if (!payload.has_value())
+                {
+                    continue;
+                }
+
+                if (!WriteString(session.inputWrite.get(), *payload))
+                {
+                    std::wcerr << L"Failed to write mouse input to child input: " << GetLastErrorMessage(GetLastError()) << L"\n";
+                    running.store(false);
+                    break;
+                }
+                continue;
+            }
+
             if (record.EventType != KEY_EVENT)
             {
                 continue;
             }
 
             const auto& key = record.Event.KeyEvent;
-            if (!key.bKeyDown)
-            {
-                continue;
-            }
-
-            const bool plainEnter = IsPlainEnterCandidate(key);
+            const auto enterKind = ClassifyEnter(key);
             const auto now = std::chrono::steady_clock::now();
 
-            if (config.doubleTapEnter && pendingEnterDeadline.has_value())
+            if (config.doubleTapEnter && pendingEnter.has_value())
             {
-                if (plainEnter && now < *pendingEnterDeadline)
+                if (key.bKeyDown && enterKind == EnterKind::Plain && now < pendingEnter->deadline)
                 {
-                    pendingEnterDeadline.reset();
-                    if (!WriteString(session.inputWrite.get(), RawEnterPayload()))
+                    const auto payload = BuildEnterPressPayload(pendingEnter->key, false);
+                    pendingEnter.reset();
+                    if (!WriteString(session.inputWrite.get(), payload))
                     {
                         std::wcerr << L"Failed to write raw Enter to child input: " << GetLastErrorMessage(GetLastError()) << L"\n";
                         running.store(false);
@@ -1149,7 +1440,12 @@ int wmain(int argc, wchar_t** argv)
                     continue;
                 }
 
-                if (now >= *pendingEnterDeadline || !plainEnter)
+                if (!key.bKeyDown && enterKind == EnterKind::Plain)
+                {
+                    continue;
+                }
+
+                if (now >= pendingEnter->deadline || !(key.bKeyDown && enterKind == EnterKind::Plain))
                 {
                     if (!flushPendingEnter())
                     {
@@ -1158,19 +1454,29 @@ int wmain(int argc, wchar_t** argv)
                 }
             }
 
-            if (config.doubleTapEnter && plainEnter)
+            if (enterKind != EnterKind::None)
             {
-                pendingEnterDeadline = now + *config.delayWindow;
+                if (key.bKeyDown)
+                {
+                    if (config.doubleTapEnter && enterKind == EnterKind::Plain)
+                    {
+                        pendingEnter = PendingEnter{ key, now + *config.delayWindow };
+                        continue;
+                    }
+
+                    const auto payload = BuildEnterPressPayload(key, UseRemappedEnterPayload(config, enterKind));
+                    if (!WriteString(session.inputWrite.get(), payload))
+                    {
+                        std::wcerr << L"Failed to write Enter remap input to child input: " << GetLastErrorMessage(GetLastError()) << L"\n";
+                        running.store(false);
+                        break;
+                    }
+                }
                 continue;
             }
 
-            const auto payload = EncodeKey(key, config);
-            if (!payload.has_value())
-            {
-                continue;
-            }
-
-            if (!WriteString(session.inputWrite.get(), *payload))
+            const auto payload = SerializeKeyEvent(key);
+            if (!WriteString(session.inputWrite.get(), payload))
             {
                 std::wcerr << L"Failed to write to child input: " << GetLastErrorMessage(GetLastError()) << L"\n";
                 running.store(false);
